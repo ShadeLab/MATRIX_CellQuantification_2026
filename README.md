@@ -19,7 +19,7 @@ Code is split up into two location: [Image processing](https://github.com/DatIns
 Metadata, including experimental design files, are included with the models, which can be run in R.
 
 ### Funding
-This research was funded by the European Union (ERC, MicroRescue, [101087042](https://cordis.europa.eu/project/id/101087042)). Views and opinions expressed are however those of the author(s) only and do not necessarily reflect those of the European Union or the European Research Council. Neither the European Union nor the granting authority can be held responsible for them. 
+This research was funded by the European Union (ERC, MicroRescue, [101087042](https://cordis.europa.eu/project/id/101087042)). Views and opinions expressed are however those of the author(s) only and do not necessarily reflect those of the European Union or the European Research Council. Neither the European Union nor the granting authority can be held responsible for them. We also acknowledge support from the Agriculture and Food Research Initiative (AFRI) of the United States Department of Agriculture (USDA) National Institute of Food and Agriculture (NIFA) Grant number #2024-67019-42477, which supported the assays involving the switchgrass rhizosphere isolates. 
 
 ### More info
 [ShadeLab](http://ashley17061.wixsite.com/shadelab/home)
