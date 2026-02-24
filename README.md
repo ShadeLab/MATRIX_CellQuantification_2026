@@ -1,6 +1,6 @@
 ## Github Repository for
 # Rapid quantification of total and active environmental bacteria using automated image analysis: insights for single cells, populations, and communities
-## by Milena Gonzalo, Xipeng Liu, Yann S. Dufour, and Ashley Shade1
+## by Milena Gonzalo, Xipeng Liu, Yann S. Dufour, and Ashley Shade
 <i>This work is in preparation.</i>
 
 
