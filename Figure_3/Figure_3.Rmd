@@ -1,0 +1,194 @@
+```{r load libraries}
+require(tidyverse)
+require(brms)
+require(rstan)
+require(tidybayes)
+require(patchwork)
+
+theme_set(theme_tidybayes())
+```
+
+```{r load logos data}
+if (!file.exists("Figure_3/data_logos.rds")) {
+    data_logos <- list.files(
+        "Figure_3/data/process_quantom",
+        pattern = "_data\\.csv$", full.names = TRUE, recursive = TRUE
+    ) |>
+        map_df(~ read_csv(.)) |>
+        full_join(read_csv(
+            "Figure_3/data/metadata.csv"
+        )) |>
+        mutate(
+            strain = as_factor(strain)
+        )
+    write_rds(data_logos, "Figure_3/data_logos.rds")
+} else {
+    data_logos <- read_rds("Figure_3/data_logos.rds")
+}
+concentration_factor <- 14342
+```
+
+```{r}
+data_logos_filtered <- data_logos |>
+    filter(
+        euler_number == 1,
+        axis_major_length > 1,
+        axis_major_length < 10,
+        axis_minor_length > 0.5,
+        equivalent_diameter_area > 0.5,
+        intensity_cv > 0.1,
+        intensity_cv < 0.3,
+        intensity_total > 10,
+        mean_distance_5_neighbors > 5,
+        flag_ring == FALSE,
+        flag_border == FALSE,
+        area < 100
+    )
+```
+
+```{r summarize logos data}
+summary_logos <- data_logos_filtered |>
+    group_by(strain, dye, replicate, strain_name, image_number, experiment, dilution) |>
+    summarise(counts = n()) |>
+    ungroup() |>
+    mutate(cells = if_else(dye == "rsg", "active", "total")) |>
+    mutate(replicate = as.factor(replicate)) |>
+    mutate(counts = counts * dilution)
+
+data_stan <- summary_logos |>
+    select(-dye, -experiment) |>
+    pivot_wider(names_from = cells, values_from = counts) |>
+    drop_na()
+
+data_stan <- data_stan |>
+    full_join(data_stan |> select(strain, replicate) |> distinct() |> mutate(uuid = row_number()))
+
+design_matrix <- model.matrix(~ 0 + strain, data_stan)
+
+data_stan_list <- list(
+    N = nrow(data_stan),
+    total = data_stan$total,
+    active = data_stan$active,
+    K = ncol(design_matrix),
+    X = design_matrix,
+    N_index = max(data_stan$uuid),
+    index = data_stan$uuid
+)
+```
+
+```{r sample STAN model}
+if (!file.exists("Figure_3/models_posteriors/Figure_3_counts_proportions_fit.rds")) {
+    fit <- stan(
+        file = "Figure_3/models_posteriors/Figure_3_counts_proportions_model.stan",
+        data = data_stan_list,
+        chains = 16,
+        warmup = 1000,
+        iter = 2000,
+        cores = 16
+    )
+    write_rds(fit, "Figure_3/models_posteriors/Figure_3_counts_proportions_fit.rds")
+} else {
+    fit <- read_rds("Figure_3/models_posteriors/Figure_3_counts_proportions_fit.rds")
+}
+```
+
+```{r posterior logos model}
+draws_logos <- fit |>
+    spread_draws(`b_proportion.*`, regex = TRUE) |>
+    rename(`b_21` = `b_proportion[1]`) |>
+    rename(`b_40` = `b_proportion[2]`) |>
+    rename(`b_45` = `b_proportion[3]`) |>
+    rename(`b_52` = `b_proportion[4]`) |>
+    rename(`b_61` = `b_proportion[5]`) |>
+    rename(`b_62` = `b_proportion[6]`) |>
+    rename(`b_79` = `b_proportion[7]`) |>
+    rename(`b_83` = `b_proportion[8]`) |>
+    rename(`b_90` = `b_proportion[9]`) |>
+    rename(`b_96` = `b_proportion[10]`) |>
+    rename(`b_98` = `b_proportion[11]`) |>
+    rename(`b_101` = `b_proportion[12]`) |>
+    rename(`b_102` = `b_proportion[13]`) |>
+    rename(`b_108` = `b_proportion[14]`) |>
+    rename(`b_112` = `b_proportion[15]`) |>
+    rename(`b_115` = `b_proportion[16]`) |>
+    rename(`b_122` = `b_proportion[17]`) |>
+    rename(`b_147` = `b_proportion[18]`) |>
+    pivot_longer(starts_with("b_"), names_to = "strain") |>
+    mutate(strain = str_remove(strain, "b_")) |>
+    full_join(summary_logos |> select(strain, strain_name) |> distinct())
+```
+
+```{r}
+plot_A <- ggplot(summary_logos |> ungroup() |>
+    group_by(strain, dye, strain_name, cells, replicate) |>
+    summarise(counts = sum(counts))) +
+    aes(x = strain_name, y = counts * concentration_factor, color = cells) +
+    geom_point(alpha = 0.75, size = 2) +
+    scale_y_log10() +
+    theme(legend.position = "top", legend.title = element_blank()) +
+    guides(shape = "none") +
+    labs(x = NULL, y = "Cells / mL") +
+    scale_x_discrete(limits = rev) +
+    theme(axis.text.y = element_text(face = "italic")) +
+    coord_flip() +
+    scale_color_manual(
+        breaks = c("total", "active"),
+        values = c("active" = "#009E73", "total" = "#CC79A7")
+    )
+# plot_A
+```
+
+```{r plot logos active proportion}
+plot_B <- ggplot() +
+    stat_pointinterval(
+        data = draws_logos, aes(x = strain_name, y = exp(value)),
+        .width = 0.95, point_interval = "mode_hdci", size = 2, linewidth = 2
+    ) +
+    expand_limits(x = 0, y = 0) +
+    labs(y = "Proportion of active cells", x = NULL) +
+    theme(legend.position = "top", axis.text.y = element_blank()) +
+    scale_x_discrete(limits = rev) +
+    coord_flip()
+# plot_B
+```
+
+```{r plot distributions}
+plot_C <- ggplot(data_logos_filtered |> filter(dye == "rsg")) +
+    aes(x = strain_name, y = intensity_total) +
+    geom_violin(adjust = 2, fill = "grey", linewidth = 0) +
+    stat_pointinterval(size = 1, linewidth = 1, .width = 0.5) +
+    scale_y_log10() +
+    labs(y = "Cell RSG intensity (a.u.)", x = NULL) +
+    scale_x_discrete(limits = rev) +
+    theme(axis.text.y = element_text(face = "italic")) +
+    coord_flip()
+# plot_C
+
+plot_D <- ggplot(data_logos_filtered |> filter(dye == "syb")) +
+    aes(x = strain_name, y = volume_approx) +
+    geom_violin(adjust = 2, fill = "grey", linewidth = 0) +
+    stat_pointinterval(size = 1, linewidth = 1, .width = 0.5) +
+    scale_y_log10() +
+    labs(y = "Cell volume (\u00b5m\u00b3)", x = NULL) +
+    theme(axis.text.y = element_blank()) +
+    scale_x_discrete(limits = rev) +
+    coord_flip()
+# plot_D
+
+plot_E <- ggplot(data_logos_filtered |> filter(dye == "syb")) +
+    aes(x = strain_name, y = eccentricity) +
+    geom_violin(adjust = 2, fill = "grey", linewidth = 0) +
+    stat_pointinterval(size = 2, linewidth = 1, .width = 0.5) +
+    labs(y = "Cell eccentricity", x = NULL) +
+    theme(axis.text.y = element_blank()) +
+    scale_x_discrete(limits = rev) +
+    coord_flip()
+# plot_E
+```
+
+```{r compose plot}
+ggsave("Figure_3/Figure_3.png",
+    (plot_A | plot_B) / (plot_C | plot_D | plot_E) + plot_annotation(tag_levels = "A"),
+    width = 8, height = 8
+)
+```

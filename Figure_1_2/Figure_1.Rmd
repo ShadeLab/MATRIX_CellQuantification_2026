@@ -1,0 +1,271 @@
+```{r load libraries}
+require(tidyverse)
+require(brms)
+require(tidybayes)
+require(rstan)
+require(patchwork)
+
+theme_set(theme_tidybayes())
+```
+
+```{r load OD data}
+data_od <- read_csv("Figure_1_2/data/optical_density/e_coli_OD.csv") |>
+    full_join(read_csv(
+        "Figure_1_2/data/optical_density/p_protegens_OD.csv"
+    )) |>
+    mutate(
+        strain = as_factor(strain),
+        strain_full_name = if_else(strain == "ecoli", "E. coli", "P. protegens")
+    )
+data_od <- data_od |>
+    full_join(data_od |> filter(cells == 0) |> group_by(strain, replicate) |> summarise(blank = mean(OD)))
+```
+
+```{r load logos data}
+if (!file.exists("Figure_1_2/data_logos.rds")) {
+    data_logos <- list.files(
+        "Figure_1_2/data/process_quantom",
+        pattern = "_data\\.csv$", full.names = TRUE, recursive = TRUE
+    ) |>
+        map_df(~ read_csv(.)) |>
+        full_join(read_csv(
+            "Figure_1_2/data/metadata.csv"
+        )) |>
+        drop_na(strain) |>
+        mutate(
+            strain = as_factor(strain),
+            dilution = 1 / dilution,
+        )
+    write_rds(data_logos, "Figure_1_2/data_logos.rds")
+} else {
+    data_logos <- read_rds("Figure_1_2/data_logos.rds")
+}
+concentration_factor <- 14342
+```
+
+```{r filter logos data}
+data_logos_filtered <- data_logos |>
+    filter(
+        euler_number == 1,
+        axis_major_length > 1,
+        axis_minor_length > 0.5,
+        equivalent_diameter_area > 0.5,
+        intensity_cv > 0.1,
+        !(mean_distance_5_neighbors < 5 & strain == "ecoli"),
+        !(mean_distance_5_neighbors < 10 & strain == "ps"),
+        flag_ring == FALSE,
+        area < 30
+    ) |>
+    mutate(strain_full_name = if_else(strain == "ecoli", "E. coli", "P. protegens"))
+```
+
+```{r summarize logos data}
+summary_logos <- data_logos_filtered |>
+    group_by(strain, time, dye, dilution, strain_full_name, replicate) |>
+    summarise(counts = n()) |>
+    ungroup() |>
+    mutate(counts = counts / dilution) |>
+    select(-dilution) |>
+    mutate(cells = if_else(dye == "rsg", "active", "total"))
+```
+
+```{r plot data}
+data_od_logos <- data_od |>
+    filter(cells > 0) |>
+    select(-cells) |>
+    full_join(summary_logos |> select(-cells) |> pivot_wider(names_from = dye, values_from = counts))
+
+plot_A <- ggplot(data_od_logos) +
+    geom_point(
+        aes(x = time, y = (OD - blank), color = "OD"),
+        size = 2, alpha = 0.75
+    ) +
+    stat_summary(
+        aes(x = time, y = (OD - blank), color = "OD"),
+        linewidth = 0.5, fun = mean, geom = "line", alpha = 0.25
+    ) +
+    geom_point(
+        aes(x = time, y = sybr30 / 3000000000 * concentration_factor, color = "total"),
+        size = 2, alpha = 0.75
+    ) +
+    stat_summary(
+        aes(x = time, y = sybr30 / 3000000000 * concentration_factor, color = "total"),
+        linewidth = 0.5, fun = mean, geom = "line", alpha = 0.25
+    ) +
+    geom_point(
+        aes(x = time, y = rsg / 3000000000 * concentration_factor, color = "active"),
+        size = 2, alpha = 0.75
+    ) +
+    stat_summary(
+        aes(x = time, y = rsg / 3000000000 * concentration_factor, color = "active"),
+        linewidth = 0.5, fun = mean, geom = "line", alpha = 0.25
+    ) +
+    facet_wrap(~strain_full_name) +
+    scale_y_continuous(sec.axis = sec_axis(~ . * 3000000000, name = "Cells / mL")) +
+    scale_color_manual(
+        name = "Legend",
+        breaks = c("OD", "total", "active"),
+        values = c("OD" = "#000000", "active" = "#009E73", "total" = "#CC79A7")
+    ) +
+    expand_limits(x = 0, y = 0) +
+    labs(y = "Optical density", x = "Time (h)") +
+    theme(legend.position = "top", legend.title = element_blank()) +
+    theme(strip.text = element_text(face = "italic"))
+
+# plot_A
+```
+
+```{r}
+data_od_sybr <- data_od |>
+    full_join(summary_logos |>
+        filter(cells == "total") |>
+        select(-cells)) |>
+    mutate(counts = if_else(cells == 0, 0, counts)) |>
+    drop_na(counts)
+```
+
+```{r model od vs sybr}
+model_od_sybr <- bf(
+    OD ~ b0 + (b1 * (counts)^b2),
+    b0 ~ 1 + (1 | strain), b1 ~ 0 + strain, b2 ~ 0 + strain,
+    nl = TRUE, family = gaussian()
+)
+
+p <- c(
+    set_prior(prior = "normal(0,0.1)", class = "b", nlpar = "b0", lb = 0, ub = 0.2),
+    set_prior(prior = "normal(0,0.1)", class = "b", nlpar = "b1", lb = 0, ub = 0.05),
+    set_prior(prior = "", class = "b", nlpar = "b2", lb = 0, ub = 1),
+    set_prior(prior = "normal(0,0.05)", class = "sigma", lb = 0, ub = 0.1),
+    set_prior(prior = "normal(0,0.1)", class = "sd", nlpar = "b0", lb = 0, ub = 1)
+)
+
+fit_od_sybr <- brm(model_od_sybr, data_od_sybr,
+    prior = p,
+    cores = 16, chains = 16, warmup = 1000, iter = 2000,
+    drop_unused_levels = TRUE,
+    control = list(adapt_delta = 0.8, max_treedepth = 10),
+    file = "Figure_1_2/models_posteriors/Figure_1_od_counts_fit"
+)
+```
+
+```{r}
+estimates <- fit_od_sybr |>
+    gather_draws(`b_b.*`, regex = TRUE) |>
+    summarise(median = median(.value), ci_low = quantile(.value, 0.025), ci_high = quantile(.value, 0.975))
+write_csv(estimates, "Figure_1_2/Figure_1_summary.csv")
+```
+
+```{r posterior draws OD}
+draws_od_sybr <- fit_od_sybr |>
+    epred_draws(expand.grid(strain = c("ecoli"), counts = (seq(0, 380, 10))^2) |>
+        rbind(expand.grid(strain = c("pseudomonas"), counts = (seq(0, 260, 10))^2))) |>
+    mutate(strain_full_name = if_else(strain == "ecoli", "E. coli", "P. protegens"))
+
+plot_B <-
+    ggplot() +
+    stat_lineribbon(
+        data = draws_od_sybr, aes(x = counts * concentration_factor, y = .epred, color = strain_full_name),
+        .width = 0.95, fill = "grey", alpha = 0.25
+    ) +
+    geom_point(
+        data = data_od_sybr,
+        aes(x = counts * concentration_factor, y = OD, color = strain_full_name),
+        size = 2, alpha = 0.75
+    ) +
+    scale_y_continuous(limits = c(0, 0.5)) +
+    labs(x = "Cells / mL", y = "Optical density") +
+    scale_color_discrete(labels = c(expression(italic("E. coli")), expression(italic("P. protegens")))) +
+    theme(legend.position = "top", legend.title = element_blank())
+# plot_B
+```
+
+```{r}
+summary_logos <- data_logos_filtered |>
+    group_by(strain, time, dye, dilution, strain_full_name, replicate, image_number) |>
+    summarise(counts = n()) |>
+    ungroup() |>
+    mutate(counts = counts / dilution) |>
+    select(-dilution) |>
+    mutate(cells = if_else(dye == "rsg", "active", "total"))
+
+data_stan <- summary_logos |>
+    select(-dye) |>
+    pivot_wider(names_from = cells, values_from = counts) |>
+    mutate(time = as.ordered(time)) |>
+    drop_na()
+
+data_stan <- data_stan |>
+    full_join(data_stan |> select(strain, time, replicate) |> distinct() |> mutate(uuid = row_number()))
+
+design_matrix <- model.matrix(~ 0 + strain:time, data_stan)
+
+data_stan_list <- list(
+    N = nrow(data_stan),
+    total = data_stan$total,
+    active = data_stan$active,
+    K = ncol(design_matrix),
+    X = design_matrix,
+    N_index = max(data_stan$uuid),
+    index = data_stan$uuid
+)
+```
+
+```{r sample STAN model}
+if (!file.exists("Figure_1_2/models_posteriors/Figure_1_counts_proportions_fit.rds")) {
+    fit <- stan(
+        file = "Figure_1_2/models_posteriors/Figure_1_counts_proportions_model.stan",
+        data = data_stan_list,
+        chains = 16,
+        warmup = 1000,
+        iter = 2000,
+        cores = 16
+    )
+    write_rds(fit, "Figure_1_2/models_posteriors/Figure_1_counts_proportions_fit.rds")
+} else {
+    fit <- read_rds("Figure_1_2/models_posteriors/Figure_1_counts_proportions_fit.rds")
+}
+```
+
+```{r posterior logos model}
+draws_logos <- fit |>
+    spread_draws(`b_proportion.*`, regex = TRUE) |>
+    rename(`b_ecoli:0` = `b_proportion[1]`) |>
+    rename(`b_pseudomonas:0` = `b_proportion[2]`) |>
+    rename(`b_ecoli:2` = `b_proportion[3]`) |>
+    rename(`b_pseudomonas:2` = `b_proportion[4]`) |>
+    rename(`b_ecoli:4` = `b_proportion[5]`) |>
+    rename(`b_pseudomonas:4` = `b_proportion[6]`) |>
+    rename(`b_ecoli:6` = `b_proportion[7]`) |>
+    rename(`b_pseudomonas:6` = `b_proportion[8]`) |>
+    rename(`b_ecoli:8` = `b_proportion[9]`) |>
+    rename(`b_pseudomonas:8` = `b_proportion[10]`) |>
+    rename(`b_ecoli:16` = `b_proportion[11]`) |>
+    rename(`b_pseudomonas:16` = `b_proportion[12]`) |>
+    rename(`b_ecoli:18` = `b_proportion[13]`) |>
+    rename(`b_pseudomonas:18` = `b_proportion[14]`) |>
+    pivot_longer(starts_with("b_")) |>
+    separate(name, into = c("strain", "time"), sep = ":") |>
+    mutate(strain = str_remove(strain, "b_")) |>
+    mutate(time = as.numeric(time)) |>
+    mutate(strain_full_name = if_else(strain == "ecoli", "E. coli", "P. protegens"))
+```
+
+```{r plot logos active proportion}
+plot_C <- ggplot() +
+    stat_pointinterval(
+        data = draws_logos, aes(x = time, y = exp(value), color = strain_full_name),
+        .width = 0.95, point_interval = "mode_hdci", position = position_dodge(width = 1), size = 2
+    ) +
+    expand_limits(y = c(0, 1)) +
+    labs(y = "Proportion of active cells", x = "Time (h)") +
+    scale_color_discrete(labels = c(expression(italic("E. coli")), expression(italic("P. protegens")))) +
+    theme(legend.position = "top", legend.title = element_blank())
+# plot_C
+```
+
+```{r compose plots}
+ggsave("Figure_1_2/Figure_1.png",
+    (plot_A / (plot_B | plot_C)) + plot_annotation(tag_levels = "A"),
+    width = 7, height = 8
+)
+```

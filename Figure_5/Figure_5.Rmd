@@ -1,0 +1,305 @@
+```{r load libraries}
+require(tidyverse)
+require(brms)
+require(rstan)
+require(tidybayes)
+require(patchwork)
+
+theme_set(theme_tidybayes())
+```
+
+```{r load data}
+if (!file.exists("Figure_5/data_logos.rds")) {
+    data_logos <- list.files(
+        "Figure_5/data/process_quantom",
+        pattern = "_data\\.csv$", full.names = TRUE, recursive = TRUE
+    ) |>
+        map_df(~ read_csv(.)) |>
+        full_join(read_csv(
+            "Figure_5/data/metadata.csv"
+        ))
+
+    soil_property <- read_csv("Figure_5/data/metadata_soil.csv")
+    data_co2 <- read_csv("Figure_5/data/data_respiration.csv") |>
+        mutate(Time_cal = Measurement_point * 0.5) |>
+        full_join(soil_property)
+    write_rds(data_logos, "Figure_5/data_logos.rds")
+} else {
+    data_logos <- read_rds("Figure_5/data_logos.rds")
+}
+concentration_factor <- 14342
+```
+
+```{r filter logos data}
+data_logos_filtered <- data_logos |>
+    filter(
+        euler_number == 1,
+        axis_major_length > 1,
+        axis_major_length < 5,
+        axis_minor_length > 0.5,
+        axis_minor_length < 3,
+        equivalent_diameter_area > 0.5,
+        equivalent_diameter_area < 3.5,
+        intensity_cv > 0.1,
+        intensity_cv < 0.3,
+        intensity_total > 10,
+        mean_distance_5_neighbors > 10,
+        flag_ring == FALSE,
+        flag_border == FALSE,
+        area < 10
+    )
+```
+
+```{r summarise logos data}
+data_logos_summary <- data_logos_filtered |>
+    group_by(experiment, Soil_id, day, dye, replicate, dilution) |>
+    summarise(counts = n(), total_fluorescence = sum(intensity_total)) |>
+    full_join(soil_property) |>
+    mutate(counts = counts * dilution, total_fluorescence = total_fluorescence * dilution)
+```
+
+```{r model respiration}
+model_respiration <- bf(CO2 ~ C * (1 - Moisture) * (1 - exp(-K * (1 - Moisture) * (Time_cal + D))),
+    C ~ 0 + Soil_id:Date, K ~ 0 + Soil_id:Date, D ~ 0 + Soil_id:Date,
+    nl = TRUE, family = gaussian()
+)
+
+p <- c(
+    set_prior("normal(6000,2000)", class = "b", nlpar = "C", lb = 2000),
+    set_prior("normal(0.075,0.025)", class = "b", nlpar = "K", lb = 0, ub = 0.2),
+    set_prior("normal(0,1)", class = "b", nlpar = "D", lb = 0, ub = 6),
+    set_prior("normal(0,400)", class = "sigma", lb = 0, ub = 500)
+)
+
+fit_respiration <- brm(model_respiration, data_co2,
+    prior = p,
+    cores = 16, chains = 16,
+    warmup = 2000, iter = 3000,
+    control = list(adapt_delta = .9),
+    drop_unused_levels = TRUE,
+    init = 0,
+    file = "Figure_5/models_posteriors/Figure_5_respiration_fit"
+)
+```
+
+```{r posterior draws respiration}
+draws_respiration <- fit_respiration |>
+    gather_draws(`b_.*`, regex = TRUE) |>
+    ungroup() |>
+    mutate(Soil_id = str_extract(.variable, "(?<=Soil_id)[^:]+")) |>
+    mutate(Date = str_extract(.variable, "(?<=Date)\\w+")) |>
+    mutate(variable = str_extract(.variable, "(?<=b_)[^_]+")) |>
+    select(-.variable) |>
+    pivot_wider(names_from = "variable", values_from = .value) |>
+    select(-D) |>
+    drop_na(Soil_id)
+
+pred_respiration <- draws_respiration |>
+    filter(.iteration < 10) |>
+    full_join(soil_property |> select(Soil_id, Moisture)) |>
+    cross_join(tibble(Time_cal = seq(0, 8, 0.1), D = 2.62)) |>
+    mutate(CO2 = C * (1 - Moisture) * (1 - exp(-K * (1 - Moisture) * (Time_cal + D)))) |>
+    full_join(soil_property)
+```
+
+```{r}
+plot_S <- ggplot() +
+    aes(x = Time_cal, y = CO2, color = Date) +
+    facet_grid(cols = vars(Site_id), rows = vars(Season)) +
+    stat_lineribbon(data = pred_respiration, .width = 0.95, alpha = 0.5, fill = "grey", linewidth = 0.5) +
+    geom_point(data = data_co2, alpha = 0.5, size = 0.5) +
+    # scale_color_manual(values = c("#2c3fc9", "#1aa8dc", "#c54708", "#b78600")) +
+    theme(legend.position = "top", legend.title = element_blank()) +
+    labs(x = "Time (h)", y = expression(CO[2] ~ (p.p.m.)))
+# plot_S
+ggsave("Figure_5/Figure_S1.png", plot_S, width = 6, height = 4)
+```
+
+```{r}
+data_stan <- data_logos_summary |>
+    ungroup() |>
+    select(Soil_id, day, dye, replicate, counts, Moisture) |>
+    pivot_wider(names_from = dye, values_from = counts) |>
+    full_join(data_logos_summary |>
+        ungroup() |>
+        select(Soil_id, day, dye, replicate, total_fluorescence) |>
+        pivot_wider(names_from = dye, values_from = total_fluorescence) |>
+        select(-syb) |>
+        rename(fluorescence = rsg))
+
+data_stan <- data_stan |>
+    full_join(data_stan |> select(Soil_id, day, replicate) |> distinct() |> mutate(uuid = row_number())) |>
+    drop_na()
+
+design_matrix <- model.matrix(~ 0 + Soil_id:day, data_stan)
+
+data_stan_list <- list(
+    N = nrow(data_stan),
+    total = data_stan$syb,
+    active = data_stan$rsg,
+    fluorescence = data_stan$fluorescence,
+    K = ncol(design_matrix),
+    X = design_matrix,
+    N_index = max(data_stan$uuid),
+    index = data_stan$uuid
+)
+```
+
+```{r sample STAN model}
+if (!file.exists("Figure_5/models_posteriors/Figure_5_counts_proportions_fit.rds")) {
+    fit <- stan(
+        file = "Figure_5/models_posteriors/Figure_5_counts_proportions_model.stan",
+        data = data_stan_list,
+        chains = 16,
+        warmup = 1000,
+        iter = 2000,
+        cores = 16
+    )
+    write_rds(fit, "Figure_5/models_posteriors/Figure_5_counts_proportions_fit.rds")
+} else {
+    fit <- read_rds("Figure_5/models_posteriors/Figure_5_counts_proportions_fit.rds")
+}
+```
+
+```{r posterior draws data}
+draws_logos <- fit |>
+    spread_draws(`b_fluo.*`, regex = TRUE) |>
+    rename(`STB1_D00` = `b_fluo[1]`) |>
+    rename(`STB2_D00` = `b_fluo[2]`) |>
+    rename(`STB3_D00` = `b_fluo[3]`) |>
+    rename(`STB4_D00` = `b_fluo[4]`) |>
+    rename(`STB5_D00` = `b_fluo[5]`) |>
+    rename(`STB6_D00` = `b_fluo[6]`) |>
+    rename(`STB1_D15` = `b_fluo[7]`) |>
+    rename(`STB2_D15` = `b_fluo[8]`) |>
+    rename(`STB3_D15` = `b_fluo[9]`) |>
+    rename(`STB4_D15` = `b_fluo[10]`) |>
+    rename(`STB5_D15` = `b_fluo[11]`) |>
+    rename(`STB6_D15` = `b_fluo[12]`) |>
+    rename(`STB1_D21` = `b_fluo[13]`) |>
+    rename(`STB2_D21` = `b_fluo[14]`) |>
+    rename(`STB3_D21` = `b_fluo[15]`) |>
+    rename(`STB4_D21` = `b_fluo[16]`) |>
+    rename(`STB5_D21` = `b_fluo[17]`) |>
+    rename(`STB6_D21` = `b_fluo[18]`) |>
+    pivot_longer(starts_with("STB"), names_to = "name", values_to = "fluorescence") |>
+    separate(name, c("Soil_id", "Date")) |>
+    full_join(soil_property)
+
+draws_all <- draws_logos |>
+    full_join(draws_respiration) |>
+    mutate(fluorescence = fluorescence / (1 - Moisture))
+
+draws_summary <- draws_all |>
+    group_by(Soil_id, Date) |>
+    summarise(
+        mC = mean(log(C)), mK = mean(log(K)),
+        sdC = sd(log(C)), sdK = sd(log(K)),
+        ci_low_C = quantile(log(C), 0.025), ci_high_C = quantile(log(C), 0.975),
+        ci_low_K = quantile(log(K), 0.025), ci_high_K = quantile(log(K), 0.975),
+        mFluo = mean(fluorescence), sdFluo = sd(fluorescence),
+        ci_low_F = quantile(fluorescence, 0.025), ci_high_F = quantile(fluorescence, 0.975)
+    ) |>
+    full_join(soil_property)
+```
+
+```{r model correlation}
+model_activity_rate <- bf(mK | mi(sdK) ~ mi(mFluo)) +
+    bf(mC | mi(sdC) ~ mi(mFluo)) +
+    bf(mFluo | mi(sdFluo) ~ 1) +
+    set_rescor(FALSE)
+
+fit_activity_rate <- brm(model_activity_rate, draws_summary,
+    cores = 16, chains = 16,
+    warmup = 5000, iter = 6000,
+    control = list(adapt_delta = .9),
+    drop_unused_levels = TRUE,
+    file = "Figure_5/models_posteriors/Figure_5_activity_rate_fit"
+)
+```
+
+```{r}
+draws_activity_rate <- fit_activity_rate |>
+    spread_draws(`b.*_m.*`, regex = TRUE, ndraws = 1000) |>
+    select(-.draw, -.chain, -.iteration)
+
+pred_activity_rate <- NULL
+mFluo <- seq(17.7, 26.8, 0.2)
+
+for (i in mFluo) {
+    pred_activity_rate <- pred_activity_rate |>
+        bind_rows(
+            draws_activity_rate |>
+                mutate(
+                    mFluo = i,
+                    mC = b_mC_Intercept + bsp_mC_mimFluo * i,
+                    mK = b_mK_Intercept + bsp_mK_mimFluo * i
+                )
+        )
+}
+```
+
+```{r}
+estimates <- draws_activity_rate |>
+    summarise(
+        median_K = median(bsp_mK_mimFluo), ci_low_K = quantile(bsp_mK_mimFluo, 0.025), ci_high_K = quantile(bsp_mK_mimFluo, 0.975),
+        median_C = median(bsp_mC_mimFluo), ci_low_C = quantile(bsp_mC_mimFluo, 0.025), ci_high_C = quantile(bsp_mC_mimFluo, 0.975)
+    )
+write_csv(estimates, "Figure_5/Figure_5_summary.csv")
+```
+
+```{r plot correlation}
+plot_A <- ggplot() +
+    stat_lineribbon(
+        data = pred_activity_rate, aes(x = exp(mFluo), y = exp(mK)),
+        .width = 0.95, fill = "grey", alpha = 0.5, linewidth = 1
+    ) +
+    geom_pointinterval(
+        data = draws_summary,
+        aes(
+            x = exp(mFluo), y = exp(mK), ymin = exp(ci_low_K), ymax = exp(ci_high_K),
+            color = Site_id, linetype = Season, shape = Date
+        ), size = 5, linewidth = 1
+    ) +
+    geom_pointinterval(
+        data = draws_summary,
+        aes(
+            x = exp(mFluo), y = exp(mK), xmin = exp(ci_low_F), xmax = exp(ci_high_F),
+            color = Site_id, linetype = Season, shape = Date
+        ), size = 5, linewidth = 1
+    ) +
+    scale_x_log10() +
+    scale_y_log10() +
+    labs(x = "Total RSG fluorescence (a.u.) / g of soil", y = "Respiration rate (1/h) / g of soil") +
+    theme(legend.title = element_blank(), legend.position = "none")
+# plot_A
+
+plot_B <- ggplot() +
+    stat_lineribbon(
+        data = pred_activity_rate, aes(x = exp(mFluo), y = exp(mC)),
+        .width = 0.95, fill = "grey", alpha = 0.5, linewidth = 1
+    ) +
+    geom_pointinterval(
+        data = draws_summary,
+        aes(
+            x = exp(mFluo), y = exp(mC), ymin = exp(ci_low_C), ymax = exp(ci_high_C),
+            color = Site_id, linetype = Season, shape = Date
+        ), size = 5, linewidth = 1
+    ) +
+    geom_pointinterval(
+        data = draws_summary,
+        aes(
+            x = exp(mFluo), y = exp(mC), xmin = exp(ci_low_F), xmax = exp(ci_high_F),
+            color = Site_id, linetype = Season, shape = Date
+        ), size = 5, linewidth = 1
+    ) +
+    scale_x_log10() +
+    scale_y_log10() +
+    labs(x = "Total RSG fluorescence (a.u.) / g of soil", y = "Substrate (a.u.)  / g of soil") +
+    theme(legend.title = element_blank())
+# plot_B
+```
+
+```{r}
+ggsave("Figure_5/Figure_5.png", plot_A + plot_B + plot_annotation(tag_levels = "A"), width = 8, height = 3.5)
+```

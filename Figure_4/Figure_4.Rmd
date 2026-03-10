@@ -1,0 +1,192 @@
+```{r load libraries}
+require(tidyverse)
+require(brms)
+require(tidybayes)
+require(patchwork)
+
+theme_set(theme_tidybayes())
+```
+
+```{r load logos data}
+if (!file.exists("Figure_4/data_logos.rds")) {
+    data_logos <- list.files(
+        "Figure_4/data/process_quantom",
+        pattern = "_data\\.csv$", full.names = TRUE, recursive = TRUE
+    ) |>
+        map_df(~ read_csv(.)) |>
+        full_join(read_csv(
+            "Figure_4/data/metadata.csv"
+        ))
+    write_rds(data_logos, "Figure_4/data_logos.rds")
+} else {
+    data_logos <- read_rds("Figure_4/data_logos.rds")
+}
+
+concentration_factor <- 14342
+```
+
+```{r}
+data_logos_filtered <- data_logos |>
+    filter(
+        euler_number == 1,
+        axis_major_length > 1,
+        axis_major_length < 10,
+        axis_minor_length > 0.5,
+        equivalent_diameter_area > 0.5,
+        intensity_cv > 0.1,
+        intensity_cv < 0.3,
+        intensity_total > 10,
+        mean_distance_5_neighbors > 5,
+        flag_ring == FALSE,
+        flag_border == FALSE,
+        area < 100
+    )
+```
+
+```{r summarize logos data}
+summary_logos <- data_logos_filtered |>
+    group_by(experiment, mesocosm, dye, treatment, dilution, moisture, site) |>
+    summarise(counts = n()) |>
+    ungroup() |>
+    mutate(cells = if_else(dye == "rsg", "active", "total")) |>
+    mutate(mesocosm = as.factor(mesocosm), counts = counts * dilution) |>
+    mutate(rsg = as.numeric(str_detect(cells, "active"))) |>
+    mutate(treated = as.numeric(str_detect(treatment, "lysozyme")))
+```
+
+```{r}
+plot_A <- ggplot(summary_logos) +
+    aes(x = treatment, y = counts * concentration_factor / (1 - moisture), color = cells, group = interaction(cells, mesocosm)) +
+    geom_point(size = 2, alpha = 0.75) +
+    geom_line(alpha = 0.25) +
+    expand_limits(y = 0) +
+    labs(y = "Cells / g of soil", x = "Treatment") +
+    theme(legend.position = "top", legend.title = element_blank()) +
+    scale_color_manual(
+        breaks = c("total", "active"),
+        values = c("active" = "#009E73", "total" = "#CC79A7")
+    ) +
+    scale_x_discrete(labels = c("c", "l")) +
+    facet_grid(cols = vars(site))
+# plot_A
+```
+
+```{r fit logos model}
+model_logos <- bf(counts ~ total + log(exp(treatment) + exp(active) - 1),
+    total ~ 0 + site,
+    treatment ~ 0 + site:treated,
+    active ~ 0 + site:rsg,
+    nl = TRUE, family = negbinomial()
+)
+
+p <- c(
+    set_prior("", nlpar = "active", class = "b", ub = 0, lb = -1),
+    set_prior("", nlpar = "treatment", class = "b", ub = 0, lb = -1),
+    set_prior("", nlpar = "total", class = "b", ub = 12)
+)
+
+fit_logos <- brm(model_logos, summary_logos,
+    prior = p,
+    cores = 16, chains = 16,
+    warmup = 2000, iter = 3000,
+    control = list(adapt_delta = .8),
+    drop_unused_levels = TRUE,
+    file = "Figure_4/models_posteriors/Figure_4_counts_proportions_fit"
+)
+```
+
+```{r}
+draws_post <- fit_logos |>
+    gather_draws(`b_.*`, regex = TRUE) |>
+    separate(.variable, into = c("var", "site"), sep = "_site") |>
+    separate(site, into = c("site", "factor"), sep = ":") |>
+    mutate(factor = replace_na(factor, "total")) |>
+    select(-var) |>
+    pivot_wider(names_from = "factor", values_from = ".value") |>
+    mutate(
+        RA = exp(treated) + exp(rsg) - 1,
+        A = exp(rsg), R = exp(treated),
+        interaction = RA / (R * A),
+    ) |>
+    mutate(RI = R - RA, SA = A - RA) |>
+    mutate(SI = 1 - R - A + RA, SARA = SA + RA) |>
+    mutate(site = str_replace(site, "Miribel7", "Miribel 7")) |>
+    mutate(site = str_replace(site, "Miribel8", "Miribel 8")) |>
+    mutate(site = str_replace(site, "StAndre", "St Andre"))
+```
+
+```{r}
+estimates <- fit_logos |>
+    gather_draws(`b_.*`, regex = TRUE) |>
+    summarise(median = median(exp(.value)), ci_low = quantile(exp(.value), 0.025), ci_high = quantile(exp(.value), 0.975))
+write_csv(estimates, "Figure_4/Figure_4_summary.csv")
+```
+
+```{r}
+draws_post_long <- draws_post %>% pivot_longer(c(SA, SARA), names_to = "category", values_to = "proportion")
+draws_summary <- draws_post %>%
+    pivot_longer(c(SA, RA, RI), names_to = "category", values_to = "proportion") %>%
+    group_by(category, site) %>%
+    summarise(mean = median(proportion)) %>%
+    mutate(category = ordered(category, levels = c("RI", "RA", "SA")))
+
+plot_B <- ggplot() +
+    geom_bar(data = draws_summary, aes(x = 0, y = mean, fill = category), stat = "identity", alpha = 0.75) +
+    stat_pointinterval(data = draws_post_long, aes(x = 0, y = proportion, group = category), .width = 0.95, size = 1, linewidth = 1) +
+    geom_line(data = tibble(site = "St Andre", x = c(-0.55, -0.55), y = c(0, 0.737)), aes(x = x, y = y), linewidth = 0.5) +
+    geom_text(data = tibble(site = "St Andre"), x = -0.75, y = 0.3415, label = "Active cells", angle = 90, size = 3) +
+    geom_line(data = tibble(site = "St Andre", x = c(0.55, 0.55), y = c(0.208, 1)), aes(x = x, y = y), linewidth = 0.5) +
+    geom_text(data = tibble(site = "St Andre"), x = 0.75, y = 0.6135, label = "Resistant cells", angle = -90, size = 3) +
+    labs(y = "Proportion", x = NULL) +
+    lims(x = c(-0.8, 0.8)) +
+    theme(
+        legend.position = "top", axis.line.x = element_blank(), axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(), legend.title = element_blank()
+    ) +
+    facet_wrap(~site)
+# plot_B
+```
+
+```{r}
+estimates <- draws_post |>
+    pivot_longer(c(RA, SA, RI), names_to = "category", values_to = "proportion") |>
+    group_by(category, site) |>
+    summarise(median = median(proportion), ci_low = quantile(proportion, 0.025), ci_high = quantile(proportion, 0.975))
+write_csv(estimates, "Figure_4/Figure_4_summary.csv", append = TRUE)
+```
+
+```{r}
+data_fluo <- data_logos_filtered |>
+    filter(dye == "rsg") |>
+    select(intensity_total, site, treatment, mesocosm)
+
+model_fluo <- bf(intensity_total ~ 0 + site + site:treatment + (1 | mesocosm), family = lognormal())
+
+fit_fluo <- brm(model_fluo, data_fluo,
+    cores = 16, chains = 16,
+    warmup = 2000, iter = 3000,
+    control = list(adapt_delta = .8),
+    drop_unused_levels = TRUE,
+    file = "Figure_4/models_posteriors/Figure_4_rsg_fluo_fit"
+)
+```
+
+```{r}
+plot_C <- ggplot(data_logos_filtered |> filter(dye == "rsg")) +
+    aes(x = treatment, y = intensity_total) +
+    geom_violin(adjust = 2, fill = "grey", linewidth = 0) +
+    stat_pointinterval(size = 1, linewidth = 1, .width = 0.5) +
+    labs(y = "Cell RSG fluorescence (a.u.)", x = "Treatment") +
+    scale_x_discrete(labels = c("c", "l")) +
+    theme(legend.position = "none") +
+    facet_grid(cols = vars(site)) +
+    scale_y_log10()
+# plot_C
+```
+
+```{r}
+ggsave("Figure_4/Figure_4.png",
+    plot_A + plot_B + plot_C + plot_annotation(tag_levels = "A") + plot_layout(widths = c(2, 2, 2)),
+    width = 9, height = 5
+)
+```

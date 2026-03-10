@@ -1,0 +1,225 @@
+```{r load libraries}
+require(tidyverse)
+require(brms)
+require(tidybayes)
+require(patchwork)
+
+theme_set(theme_tidybayes())
+```
+
+```{r load OD data}
+data_od <- read_csv("Figure_1_2/data/optical_density/e_coli_OD.csv") |>
+    full_join(read_csv(
+        "Figure_1_2/data/optical_density/p_protegens_OD.csv"
+    )) |>
+    mutate(
+        strain = as_factor(strain),
+        strain_full_name = if_else(strain == "ecoli", "E. coli", "P. protegens")
+    )
+data_od <- data_od |>
+    full_join(data_od |> filter(cells == 0) |> group_by(strain, replicate) |> summarise(blank = mean(OD)))
+```
+
+```{r load logos data}
+if (!file.exists("Figure_1_2/data_logos.rds")) {
+    data_logos <- list.files(
+        "Figure_1_2/data/process_quantom",
+        pattern = "_data\\.csv$", full.names = TRUE, recursive = TRUE
+    ) |>
+        map_df(~ read_csv(.)) |>
+        full_join(read_csv(
+            "Figure_1_2/data/metadata.csv"
+        )) |>
+        drop_na(strain) |>
+        mutate(
+            strain = as_factor(strain),
+            dilution = 1 / dilution,
+        )
+    write_rds(data_logos, "Figure_1_2/data_logos.rds")
+} else {
+    data_logos <- read_rds("Figure_1_2/data_logos.rds")
+}
+
+data_logos_filtered <- data_logos |>
+    filter(
+        euler_number == 1,
+        axis_major_length > 1,
+        axis_minor_length > 0.5,
+        equivalent_diameter_area > 0.5,
+        intensity_cv > 0.1,
+        !(mean_distance_5_neighbors < 5 & strain == "ecoli"),
+        !(mean_distance_5_neighbors < 10 & strain == "ps"),
+        flag_ring == FALSE,
+        area < 30
+    ) |>
+    mutate(strain_full_name = if_else(strain == "ecoli", "E. coli", "P. protegens"))
+```
+
+```{r summarize logos data}
+summary_logos <- data_logos_filtered |>
+    group_by(strain, time, dye, dilution, strain_full_name, replicate) |>
+    summarise(counts = n()) |>
+    ungroup() |>
+    mutate(counts = counts / dilution) |>
+    select(-dilution) |>
+    mutate(cells = if_else(dye == "rsg", "active", "total"))
+```
+
+```{r model growth rate}
+data_gr <- summary_logos |>
+    filter(dye == "sybr30") |>
+    select(-dye, -cells) |>
+    add_row(strain = "ecoli", time = -2, counts = 1814) |>
+    add_row(strain = "ecoli", time = -2, counts = 2538) |>
+    add_row(strain = "ecoli", time = -2, counts = 2176) |>
+    add_row(strain = "pseudomonas", time = -2, counts = 1164) |>
+    add_row(strain = "pseudomonas", time = -2, counts = 1425) |>
+    add_row(strain = "pseudomonas", time = -2, counts = 1324)
+
+model_gr <- bf(
+    counts ~ 0 + strain + s(time, by = strain, k = 6),
+    family = lognormal()
+)
+
+fit_gr <- brm(model_gr, data_gr,
+    cores = 16, chains = 16, warmup = 2000, iter = 3000,
+    file = "Figure_1_2/models_posteriors/Figure_2_growth_fit"
+)
+```
+
+```{r sample posterior growth rate}
+data_gr_new <- expand.grid(
+    time = sort(c(c(0, 2, 4, 6, 8, 16, 18) - 0.1, c(0, 2, 4, 6, 8, 16, 18), c(0, 2, 4, 6, 8, 16, 18) + 0.1)),
+    strain = c("ecoli", "pseudomonas")
+)
+
+draws_gr <- fit_gr |>
+    posterior_smooths("s(time,by=strain,k=6)", newdata = data_gr_new, ndraws = 1000)
+
+draws_gr <- draws_gr[, -1] - draws_gr[, -42]
+draws_gr <- (draws_gr[, -1] + draws_gr[, -41]) / 2
+draws_gr <- draws_gr[, seq(1, 40, 3)]
+
+colnames(draws_gr) <- expand.grid(
+    time = c(0, 2, 4, 6, 8, 16, 18),
+    strain = c("ecoli", "pseudomonas")
+) |>
+    mutate(label = str_c(strain, time, sep = ":")) |>
+    pull(label)
+
+draws_gr <- draws_gr |>
+    as_tibble() |>
+    pivot_longer(cols = everything()) |>
+    separate(name, c("strain", "time"), sep = ":") |>
+    mutate(time = as.numeric(time))
+
+draws_gr_summary <- draws_gr |>
+    group_by(strain, time) |>
+    summarise(gr = mean(value), sd_gr = sd(value))
+```
+
+```{r model growth rate vs volume}
+data <- data_logos |>
+    full_join(draws_gr_summary) |>
+    mutate(strain_full_name = if_else(strain == "ecoli", "E. coli", "P. protegens"))
+
+data_gr_vol <- data |>
+    filter(dye == "sybr30") |>
+    drop_na(volume_approx) |>
+    group_by(time, strain, dye, gr, replicate, sd_gr) |>
+    summarise(vol = mean(log(volume_approx))) |>
+    mutate(time = as.factor(time)) |>
+    rename(sdgr = sd_gr) |>
+    mutate(strain_full_name = if_else(strain == "ecoli", "E. coli", "P. protegens"))
+
+model_gr_vol <- bf(vol ~ 0 + strain + mi(gr)) +
+    bf(gr | mi(sdgr) ~ 0 + strain:time) +
+    set_rescor(FALSE)
+
+fit_gr_vol <- brm(model_gr_vol, data_gr_vol,
+    cores = 16, chains = 16, warmup = 2000, iter = 1000,
+    drop_unused_levels = TRUE,
+    file = "Figure_1_2/models_posteriors/Figure_2_growth_volume_fit"
+)
+```
+
+```{r sample posterior}
+draws_gr_vol <- fit_gr_vol |>
+    spread_draws(`.*vol.*`, regex = TRUE, ndraws = 100) |>
+    select(-.draw, -.chain, -.iteration, -sigma_vol)
+
+pred_gr_vol <- NULL
+gr <- seq(-0.005, 0.055, 0.005)
+
+for (i in gr) {
+    pred_gr_vol <- pred_gr_vol |>
+        bind_rows(
+            draws_gr_vol |>
+                mutate(
+                    gr = i,
+                    vol_ecoli = b_vol_strainecoli + bsp_vol_migr * i, b_vol_strainecoli,
+                    vol_pseudomonas = b_vol_strainpseudomonas + bsp_vol_migr * i
+                )
+        )
+}
+
+pred_gr_vol <- pred_gr_vol |>
+    pivot_longer(c(vol_ecoli, vol_pseudomonas), names_to = "strain", values_to = "vol") |>
+    mutate(strain = str_remove(strain, "vol_")) |>
+    mutate(strain_full_name = if_else(strain == "ecoli", "E. coli", "P. protegens"))
+```
+
+```{r}
+estimates <- fit_gr_vol |>
+    gather_draws(`bsp_vol_migr`, regex = TRUE) |>
+    summarise(median = median(.value), ci_low = quantile(.value, 0.025), ci_high = quantile(.value, 0.975))
+write_csv(estimates, "Figure_1_2/Figure_2_summary.csv")
+```
+
+```{r make plots}
+plot_A <- ggplot(data |> filter(dye == "rsg")) +
+    aes(x = factor(time), y = intensity_total, fill = strain) +
+    geom_violin(bounds = c(1.5, 4.5), alpha = 0.75, adjust = 2, linewidth = 0) +
+    stat_pointinterval(.width = 0.5, point_interval = "median_qi", linewidth = 0.5, size = 2) +
+    facet_wrap(~strain_full_name) +
+    scale_y_log10() +
+    labs(x = "Time (h)", y = "Cell RSG fluorescence (a.u.)") +
+    theme(legend.position = "none") +
+    theme(strip.text = element_text(face = "italic"))
+# plot_A
+
+plot_B <- ggplot(data |> filter(dye == "sybr30")) +
+    aes(x = factor(time), y = eccentricity, fill = strain) +
+    geom_violin(adjust = 2, linewidth = 0, alpha = 0.75) +
+    stat_pointinterval(.width = 0.5, point_interval = "median_qi", linewidth = 0.5, size = 2) +
+    facet_wrap(~strain_full_name) +
+    labs(x = "Time (h)", y = "Cell eccentricity") +
+    theme(legend.position = "none") +
+    theme(strip.text = element_text(face = "italic"))
+# plot_B
+
+plot_C <- ggplot(data |> filter(dye == "sybr30")) +
+    aes(x = factor(time), y = volume_approx, fill = strain) +
+    geom_violin(bounds = c(0.6, 2), adjust = 2, linewidth = 0, alpha = 0.75) +
+    stat_pointinterval(.width = 0.5, point_interval = "median_qi", linewidth = 0.5, size = 2) +
+    facet_wrap(~strain_full_name) +
+    labs(x = "Time (h)", y = "Cell volume (\u00b5m\u00b3)") +
+    scale_y_log10() +
+    theme(legend.position = "none") +
+    theme(strip.text = element_text(face = "italic"))
+# plot_C
+
+plot_D <-
+    ggplot() +
+    stat_lineribbon(data = pred_gr_vol, aes(x = gr, y = exp(vol), color = strain_full_name), .width = 0.95, fill = "grey", alpha = 0.25, linewidth = 1) +
+    geom_point(data = data_gr_vol, aes(x = gr, y = exp(vol), color = strain_full_name), size = 2, alpha = 0.75) +
+    scale_y_log10() +
+    labs(x = "Growth rate (1/h)", y = bquote("Cell volume (\u00b5m\u00b3)")) +
+    theme(legend.position = "top", legend.title = element_blank()) +
+    scale_color_discrete(labels = c(expression(italic("E. coli")), expression(italic("P. protegens"))))
+# plot_D
+```
+
+```{r compose plots}
+ggsave("Figure_1_2/Figure_2.png", (plot_A | plot_B) / (plot_C | plot_D) + plot_annotation(tag_levels = "A"), width = 8, height = 8)
+```

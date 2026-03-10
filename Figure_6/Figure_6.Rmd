@@ -1,0 +1,175 @@
+```{r load libraries}
+require(tidyverse)
+require(brms)
+require(rstan)
+require(tidybayes)
+require(patchwork)
+
+theme_set(theme_tidybayes())
+```
+
+```{r load data}
+if (!file.exists("Figure_6/data_logos.rds")) {
+    data_logos <- list.files(
+        "Figure_6/data/process_quantom",
+        pattern = "_data\\.csv$", full.names = TRUE, recursive = TRUE
+    ) |>
+        map_df(~ read_csv(.)) |>
+        full_join(read_csv(
+            "Figure_6/data/metadata.csv"
+        ))
+    write_rds(data_logos, "Figure_6/data_logos.rds")
+} else {
+    data_logos <- read_rds("Figure_6/data_logos.rds")
+}
+concentration_factor <- 14342
+```
+
+```{r filter logos data}
+data_logos_filtered <- data_logos |>
+    filter(
+        euler_number == 1,
+        axis_major_length > 1,
+        axis_major_length < 10,
+        axis_minor_length > 0.5,
+        axis_minor_length < 5,
+        equivalent_diameter_area > 0.5,
+        equivalent_diameter_area < 5,
+        intensity_cv > 0.1,
+        intensity_cv < 0.3,
+        intensity_total > 10,
+        mean_distance_5_neighbors > 10,
+        flag_ring == FALSE,
+        flag_border == FALSE,
+        area < 10
+    )
+```
+
+```{r summarize logos data}
+summary_logos <- data_logos_filtered |>
+    group_by(soil, treatment, mesocosm, dye, date, experiment, moisture, dilution, image_number) |>
+    summarise(counts = n()) |>
+    ungroup() |>
+    mutate(cells = if_else(dye == "rsg", "active", "total"))
+
+data_stan <- summary_logos |>
+    select(soil, treatment, cells, counts, mesocosm, image_number) |>
+    pivot_wider(names_from = cells, values_from = counts) |>
+    drop_na()
+
+design_matrix <- model.matrix(~ 0 + soil:treatment, data_stan)
+
+data_stan_list <- list(
+    N = nrow(data_stan),
+    total = data_stan$total,
+    active = data_stan$active,
+    K = ncol(design_matrix),
+    X = design_matrix,
+    N_index = max(data_stan$mesocosm),
+    index = data_stan$mesocosm
+)
+```
+
+```{r sample STAN model}
+if (!file.exists("Figure_6/models_posteriors/Figure_6_counts_proportion_fit.rds")) {
+    fit <- stan(
+        file = "Figure_6/models_posteriors/Figure_6_counts_proportion_model.stan",
+        data = data_stan_list,
+        chains = 16,
+        warmup = 1000,
+        iter = 2000,
+        cores = 16
+    )
+    write_rds(fit, "Figure_6/models_posteriors/Figure_6_counts_proportion_fit.rds")
+} else {
+    fit <- read_rds("Figure_6/models_posteriors/Figure_6_counts_proportion_fit.rds")
+}
+```
+
+```{r}
+estimates <- fit |>
+    spread_draws(`b_.*`, regex = TRUE) |>
+    mutate(
+        diff_total_soil = `b_total[2]` - `b_total[1]`,
+        diff_total_gal_heat = `b_total[3]` - `b_total[1]`,
+        diff_total_mir_heat = `b_total[4]` - `b_total[2]`,
+        diff_total_heat = `b_total[4]` - `b_total[3]`,
+        diff_prop_soil = `b_proportion[2]` - `b_proportion[1]`,
+        diff_prop_gal_heat = `b_proportion[3]` - `b_proportion[1]`,
+        diff_prop_mir_heat = `b_proportion[4]` - `b_proportion[2]`,
+        diff_prop_heat = `b_proportion[4]` - `b_proportion[3]`,
+    ) |>
+    ungroup() |>
+    select(starts_with("diff_")) |>
+    pivot_longer(starts_with("diff_"), names_to = "variable", values_to = "value") |>
+    group_by(variable) |>
+    summarise(median = median(value), ci_low = quantile(value, 0.025), ci_high = quantile(value, 0.975))
+
+write_csv(estimates, "Figure_6/Figure_6_summary.csv")
+```
+
+```{r posterior logos model}
+draws_logos <- fit |>
+    spread_draws(`b_proportion.*`, regex = TRUE) |>
+    rename(`Galibier:Control` = `b_proportion[1]`) |>
+    rename(`Miribel:Control` = `b_proportion[2]`) |>
+    rename(`Galibier:Heated` = `b_proportion[3]`) |>
+    rename(`Miribel:Heated` = `b_proportion[4]`) |>
+    pivot_longer(c(`Galibier:Control`, `Miribel:Control`, `Galibier:Heated`, `Miribel:Heated`)) |>
+    separate(name, into = c("soil", "treatment")) |>
+    mutate(proportion = exp(value))
+```
+
+```{r}
+plot_A <- ggplot(summary_logos |> ungroup() |>
+    group_by(soil, treatment, moisture, mesocosm, dilution, cells) |>
+    summarise(counts = sum(counts))) +
+    aes(
+        x = treatment, y = counts * concentration_factor * dilution / (1 - moisture),
+        color = cells, group = interaction(cells, soil)
+    ) +
+    geom_point(size = 3, alpha = 0.75, position = position_dodge(-0.4)) +
+    expand_limits(y = 0) +
+    labs(y = "Cells / g of soil", x = "Treatment") +
+    theme(legend.position = "top", legend.title = element_blank(), axis.title.x = element_blank()) +
+    facet_wrap(~soil) +
+    scale_color_manual(
+        breaks = c("total", "active"),
+        values = c("active" = "#009E73", "total" = "#CC79A7")
+    )
+# plot_A
+```
+
+```{r plot logos active proportion}
+plot_B <- ggplot() +
+    stat_pointinterval(
+        data = draws_logos, aes(x = treatment, y = proportion),
+        .width = 0.95, point_interval = "mode_hdci", position = position_dodge(width = 1)
+    ) +
+    expand_limits(x = 0, y = 0) +
+    labs(y = "Proportion of active cells", x = "Treatment") +
+    theme(legend.position = "top", legend.title = element_blank(), axis.title.x = element_blank()) +
+    facet_wrap(~soil) +
+    scale_x_discrete(labels = c("c", "h"))
+# plot_B
+```
+
+```{r}
+plot_C <- ggplot(data_logos_filtered |> filter(dye == "rsg")) +
+    aes(x = treatment, y = intensity_total) +
+    geom_violin(fill = "grey", alpha = 0.5, linewidth = 0) +
+    stat_pointinterval(.width = 0.5, size = 1) +
+    expand_limits(y = 0) +
+    scale_y_log10() +
+    labs(y = "Cell RSG fluorescence (a.u.)", x = "Treatment") +
+    facet_wrap(~soil) +
+    theme(axis.title.x = element_blank()) +
+    scale_x_discrete(labels = c("c", "h"))
+# plot_C
+```
+
+```{r}
+ggsave("Figure_6/Figure_6.png", plot_A + plot_B + plot_C + plot_annotation(tag_levels = "A") + plot_layout(widths = c(2, 1, 1)),
+    width = 7, height = 4
+)
+```
