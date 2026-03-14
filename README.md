@@ -1,5 +1,5 @@
 ## Github Repository for
-# MATRIX: Rapid Quantification of Total and Active Microbial Cells with Single‑Cell Pheno-types for Environmental Microbiomes
+# MATRIX: Rapid Quantification of Total and Active Microbial Cells with Single‑Cell Phenotypes for Environmental Microbiomes
 ## by Milena Gonzalo, Xipeng Liu, Yann S. Dufour, and Ashley Shade
 <i>This work submitted and has a preprint.</i>
 
