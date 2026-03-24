@@ -5,7 +5,7 @@
 
 
 ### Data
-The raw images (.tif) and image-processed data files (.csv) with experimental metadata are available on [FigShare](https://doi.org/10.6084/m9.figshare.30883721).
+The raw images (.tif) and image-processed data files (.csv) with experimental metadata (.csv) are available on [FigShare](https://doi.org/10.6084/m9.figshare.30883721).
 
 ### To cite this work or code
 Gonzalo M, X Liu, YS Dufour and A Shade. 2026. MATRIX: Rapid Quantification of Total and Active Microbial Cells with Single‑Cell Phenotypes for Environmental Microbiomes. bioRXiv. [doi: 10.64898/2026.03.16.712149v1.full ](https://doi.org/10.64898/2026.03.16.712149 )
