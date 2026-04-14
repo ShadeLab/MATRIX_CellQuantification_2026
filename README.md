@@ -20,6 +20,7 @@ Metadata, including experimental design files, are included with the .csv files.
 ### Notes
 * Docker is required for image processing.  [Install Docker](https://docs.docker.com/get-started/get-docker/)
 * Git is required for data quality checking, statistical analysis, and visualization.  [Install git.](https://git-scm.com/install/)
+* To run the processed image data and reproduce Figures, create a working directory that houses the .Rmd scripts and also the original file structure downloaded from FigShare - per figure.
 * For image processing (process_quantom) it is critical that image file names match that provided in their .csv metadata file. Consider using [CheckNames_MATRIX.R]() to ensure equivalency of file names before proceeding with process_quantom.  
 
 ### Funding
